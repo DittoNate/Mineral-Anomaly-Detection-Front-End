@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>OreFox GeoJSON Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  </head>
+
+  <body>
+    <div class="sidebar">
+      <div class="logo-container">
+        <img src="images/logo.png" alt="OreFox Logo" class="logo-img" />
+      </div>
+      <div class="nav-buttons">
+        <button class="nav-button"><i class="fa-solid fa-house"></i> Home</button>
+        <button class="nav-button active"><i class="fa-solid fa-chart-area"></i> Anomaly Detection</button>
+        <button class="nav-button"><i class="fa-solid fa-gear"></i> Settings</button>
+      </div>
+
+      <div class="login-section">
+        <button class="nav-button"><i class="fa-solid fa-right-to-bracket"></i> Login</button>
+      </div>
+    </div>
+
+    <main>
+      <h1 style="color:#ff7319;">Mineral Anomaly Detection</h1>
+      <div class="map-description">
+        <p>This interactive map visualises mineral anomaly data across Queensland, helping identify high-potential areas for mineral deposits. Each grid 
+          tile displays predicted mineral types, confidence scores, and location information, based on pre-analysed magnetic survey data. Hover over a 
+          tile to view key insights.
+        </p>
+      </div>
+      <div id="map"></div>
+    </main>
+
+    <footer class="footer">
+      <p>© 2025 OreFox AI Limited | Built with Leaflet</p>
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/h3-js@4.2.1/dist/h3-js.umd.js"></script>
+    <script src="https://unpkg.com/papaparse@5.3.2/papaparse.min.js"></script>
+    <script>
+      const map = L.map('map').setView([-26.5, 145.5], 6);
+
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 18
+      }).addTo(map);
+
+      const hexagons = [];
+      let selectedHex = null;
+      let currentMineral = "AU_CONF";
+      let confidenceThreshold = 0; // Slider value: 0–100
+
+      let minAU = Infinity, maxAU = -Infinity;
+      let minCU = Infinity, maxCU = -Infinity;
+
+      // === Anomaly Info Panel ===
+      const anomalyInfo = L.control({ position: 'topright' });
+      anomalyInfo.onAdd = function () {
+        this._div = L.DomUtil.create('div', 'info anomaly-container');
+        this.update();
+        return this._div;
+      };
+      anomalyInfo.update = function (props, latlng) {
+        this._div.innerHTML = props ? `
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h4>Anomaly Info</h4>
+            <button id="more-btn" class="more-button-icon" aria-label="More options">
+              <i class="fa-solid fa-ellipsis-h"></i>
+            </button>
+          </div>
+          <b>Placeholder Name</b><br>
+          <i>Address: Placeholder Address</i><br>
+          <i><b>LAT:</b> ${latlng.lat.toFixed(5)} <b>LON:</b> ${latlng.lng.toFixed(5)}</i>
+          <div id="more-options" class="more-options hidden">
+            <button id="download-btn"><i class="fa-solid fa-download"></i> Download</button>
+            <button id="share-btn"><i class="fa-solid fa-share-nodes"></i> Share</button>
+          </div>` : "<h4>Click a tile to view info</h4>";
+
+        setTimeout(() => {
+          const moreBtn = document.getElementById('more-btn');
+          moreBtn?.addEventListener('click', () => {
+            document.getElementById('more-options').classList.toggle('hidden');
+          });
+        }, 0);
+      };
+      anomalyInfo.addTo(map);
+
+      // === Confidence Box ===
+      const confidenceBox = L.control({ position: 'bottomright' });
+      confidenceBox.onAdd = function () {
+        this._div = L.DomUtil.create('div', 'info confidence-box');
+        this._div.innerHTML = `
+          <h4>Confidence Scores</h4>
+          <div id="confidence-values">
+            <label><input type="radio" name="mineral" value="AU_CONF" checked><strong>Gold:</strong> <span id="au-value">---</span>%</label><br>
+            <label><input type="radio" name="mineral" value="CU_CONF"><strong>Copper:</strong> <span id="cu-value">---</span>%</label>
+          </div><br>
+          <label for="threshold-slider"><strong>Confidence Threshold</strong></label><br>
+          <label><span id="threshold-value">0%</span></label>
+          <input type="range" id="threshold-slider" min="0" max="100" step="1" value="0">
+        `;
+        return this._div;
+      };
+      confidenceBox.update = function (props) {
+        document.getElementById('au-value').textContent = props ? (props.AU_CONF * 100).toFixed(1) : "---";
+        document.getElementById('cu-value').textContent = props ? (props.CU_CONF * 100).toFixed(1) : "---";
+      };
+      confidenceBox.addTo(map);
+
+      // === Legend + Opacity Slider ===
+      const legend = L.control({ position: 'bottomleft' });
+      legend.onAdd = function () {
+        const div = L.DomUtil.create('div', 'info');
+        div.innerHTML = `
+          <label for="opacity-slider"><strong>Tile Transparency:</strong></label><br>
+          <label><span id="opacity-value">60</span>%</label>
+          <input type="range" id="opacity-slider" min="0" max="1" step="0.05" value="0.6"><br><br>
+          <div class="legend-bar-container">
+            <div class="legend-bar"></div>
+            <div class="legend-dot" id="legend-dot"></div>
+          </div>
+          <div class="legend-labels">
+            <span>LOW CONF</span><span>HIGH CONF</span>
+          </div>`;
+        return div;
+      };
+      legend.addTo(map);
+
+      function updateLegendDot(score) {
+        const min = currentMineral === 'AU_CONF' ? minAU : minCU;
+        const max = currentMineral === 'AU_CONF' ? maxAU : maxCU;
+
+        const percent = ((score - min) / (max - min)) * 100;
+        const dot = document.getElementById('legend-dot');
+
+        if (dot && !isNaN(percent)) {
+          dot.style.left = `${Math.max(0, Math.min(100, percent))}%`;
+          dot.style.display = 'block';
+        }
+      }
+
+      // === Interactivity ===
+      document.addEventListener('input', e => {
+        if (e.target.id === 'opacity-slider') {
+          const newOpacity = parseFloat(e.target.value);
+          document.getElementById('opacity-value').textContent = Math.round(newOpacity * 100);
+          hexagons.forEach(hex => {
+            hex.setStyle({ fillOpacity: newOpacity });
+          });
+        }
+
+        if (e.target.id === 'threshold-slider') {
+          confidenceThreshold = parseFloat(e.target.value); 
+          document.getElementById('threshold-value').textContent = `${confidenceThreshold}%`;
+          updateTileColors();
+        }
+      });
+
+      document.querySelectorAll('input[name="mineral"]').forEach(input => {
+        input.addEventListener('change', e => {
+          currentMineral = e.target.value;
+          updateTileColors();
+        });
+      });
+
+      // === Colour Interpolation ===
+      function interpolateColor(score, min, max) {
+        if (max === min) return `rgb(255,255,255)`; // Avoid divide-by-zero
+
+        const clamped = Math.max(min, Math.min(score, max));
+        const scaled = (clamped - min) / (max - min);
+        const grey = Math.round(scaled * 255); // Higher = whiter
+
+        return `rgb(${grey}, ${grey}, ${grey})`;
+      }
+
+      // === Tile Rendering Logic ===
+      function updateTileColors() {
+        const thresholdDecimal = confidenceThreshold / 100;
+
+        hexagons.forEach(hex => {
+          const props = hex.featureProps;
+          const score = props[currentMineral];
+
+          const isValid = typeof score === 'number' && !isNaN(score);
+          const isVisible = isValid && score >= thresholdDecimal;
+
+          const min = currentMineral === 'AU_CONF' ? minAU : minCU;
+          const max = currentMineral === 'AU_CONF' ? maxAU : maxCU;
+
+          hex.setStyle({
+            fillColor: isValid ? interpolateColor(score, min, max) : '#ccc'
+          });
+
+          if (isVisible) {
+            if (!map.hasLayer(hex)) map.addLayer(hex);
+          } else {
+            if (map.hasLayer(hex)) map.removeLayer(hex);
+          }
+        });
+      }
+
+
+      // === Load CSV + H3 Tile Rendering ===
+      fetch("inference_sample.csv")
+        .then(res => res.text())
+        .then(csvText => {
+          const parsed = Papa.parse(csvText, { header: true }).data;
+          const hexData = {};
+
+          parsed.forEach(row => {
+            const lat = parseFloat(row.LAT);
+            const lon = parseFloat(row.LON);
+            const au = parseFloat(row.AU_CONF);
+            const cu = parseFloat(row.CU_CONF);
+            if (isNaN(lat) || isNaN(lon)) return;
+
+            if (!isNaN(au)) {
+              minAU = Math.min(minAU, au);
+              maxAU = Math.max(maxAU, au);
+            }
+            if (!isNaN(cu)) {
+              minCU = Math.min(minCU, cu);
+              maxCU = Math.max(maxCU, cu);
+            }
+
+            const h3Index = h3.latLngToCell(lat, lon, 5);
+            if (!hexData[h3Index]) {
+              hexData[h3Index] = { AU_CONF: 0, CU_CONF: 0, points: [] };
+            }
+
+            hexData[h3Index].AU_CONF = Math.max(hexData[h3Index].AU_CONF, au);
+            hexData[h3Index].CU_CONF = Math.max(hexData[h3Index].CU_CONF, cu);
+            hexData[h3Index].points.push({ lat, lon });
+          });
+
+          Object.entries(hexData).forEach(([h3Index, props]) => {
+            const boundary = h3.cellToBoundary(h3Index, true);
+            const latlngs = boundary.map(([lng, lat]) => [lat, lng]);
+            const center = h3.cellToLatLng(h3Index);
+            const min = currentMineral === 'AU_CONF' ? minAU : minCU;
+            const max = currentMineral === 'AU_CONF' ? maxAU : maxCU;
+
+            const hex = L.polygon(latlngs, {
+              color: '#444',
+              fillColor: interpolateColor(props[currentMineral], min, max),
+              fillOpacity: 0.6,
+              weight: 1
+            }).addTo(map);
+
+            hex.featureProps = props;
+            hexagons.push(hex);
+
+            hex.on('click', () => {
+              confidenceBox.update(props);
+              anomalyInfo.update(props, { lat: center[0], lng: center[1] });
+
+              updateLegendDot(props[currentMineral]);
+
+              if (selectedHex) {
+                selectedHex.setStyle({ weight: 1, color: '#444' });
+              }
+              hex.setStyle({ weight: 3, color: '#ff7319' });
+              selectedHex = hex;
+            });
+
+            hex.on('mouseover', () => {
+              hex.setStyle({ weight: 2, color: '#ff6600', fillOpacity: 0.8 });
+            });
+
+            hex.on('mouseout', () => {
+              hex.setStyle({
+                weight: selectedHex === hex ? 3 : 1,
+                color: selectedHex === hex ? '#ff7319' : '#444',
+                fillOpacity: parseFloat(document.getElementById('opacity-slider').value || 0.6)
+              });
+            });
+          });
+        })
+        .catch(err => console.error("CSV load error:", err));
+    </script>
+
+  </body>
+</html>
